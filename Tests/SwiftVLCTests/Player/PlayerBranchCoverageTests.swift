@@ -87,6 +87,52 @@ extension Integration {
     }
 
     @Test
+    func `pause while resume transition is in flight defers pause request`() {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
+      player.pauseTransition = .resuming
+
+      #expect(player.issuePause() == false)
+
+      #expect(player.deferredPauseCommand == .pause)
+      #expect(player.isPlaybackRequestedActive == false)
+    }
+
+    @Test
+    func `resume while pause transition is in flight defers resume request`() {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(state: .paused, isPlaybackRequestedActive: false)
+      player.pauseTransition = .pausing
+
+      #expect(player.issueResume())
+
+      #expect(player.deferredPauseCommand == .resume)
+      #expect(player.isPlaybackRequestedActive)
+    }
+
+    @Test
+    func `resume while cached state remains active republishes play intent`() {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: false)
+
+      #expect(player.issueResume())
+
+      #expect(player.isPlaybackRequestedActive)
+    }
+
+    @Test
+    func `cancelPendingPause clears queued pause and restores play intent`() {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: false)
+      player.deferredPauseCommand = .pause
+
+      player.cancelPendingPause()
+
+      #expect(player.deferredPauseCommand == nil)
+      #expect(player.isPlaybackRequestedActive)
+    }
+
+    @Test
     func `togglePlayPause from paused calls resume`() {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(state: .paused)
@@ -190,6 +236,33 @@ extension Integration {
       #expect(player.currentTime == .seconds(15))
     }
 
+    @Test
+    func `seek by offset rejects millisecond overflow`() {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(
+        currentTime: .milliseconds(Int64.max),
+        duration: nil,
+        isSeekable: true
+      )
+
+      #expect(throws: VLCError.self) {
+        try player.seek(by: .milliseconds(1))
+      }
+    }
+
+    @Test
+    func `absolute seek rejects times beyond known duration`() {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(
+        duration: .seconds(5),
+        isSeekable: true
+      )
+
+      #expect(throws: VLCError.self) {
+        try player.seek(to: .seconds(6))
+      }
+    }
+
     // MARK: - checked position seek
 
     /// Seeking to a typed position when duration is known must optimistically
@@ -276,6 +349,31 @@ extension Integration {
     func `selectedSubtitleTrack nil setter is a no-op safe path`() {
       let player = Player(instance: TestInstance.shared)
       player.selectedSubtitleTrack = nil
+    }
+
+    @Test
+    func `selectedAudioTrack ignores a stale track id`() {
+      let player = Player(instance: TestInstance.shared)
+      let staleTrack = Track(
+        id: "swiftvlc-stale-audio-track",
+        type: .audio,
+        name: "Stale audio",
+        codec: 0,
+        language: nil,
+        trackDescription: nil,
+        isSelected: false,
+        bitrate: 0,
+        channels: 2,
+        sampleRate: 44100,
+        width: nil,
+        height: nil,
+        frameRate: nil,
+        encoding: nil
+      )
+
+      player.selectedAudioTrack = staleTrack
+
+      #expect(player.selectedAudioTrack == nil)
     }
 
     // MARK: - isActive across states
@@ -467,6 +565,15 @@ extension Integration {
     func `recording toggle without media does not crash`() {
       let player = Player(instance: TestInstance.shared)
       player.startRecording(to: "/tmp/swiftvlc-test-recording")
+      player.stopRecording()
+    }
+
+    @Test
+    func `recording toggle with loaded media reaches libVLC record path`() throws {
+      let player = Player(instance: TestInstance.shared)
+      try player.load(Media(url: TestMedia.twosecURL))
+
+      player.startRecording(to: "/tmp")
       player.stopRecording()
     }
 

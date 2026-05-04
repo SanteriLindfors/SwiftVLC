@@ -1,5 +1,5 @@
 #if os(iOS) || os(macOS)
-@testable import SwiftVLC
+@_spi(PrivateMacOSPiP) @testable import SwiftVLC
 import AVFoundation
 import SwiftUI
 import Testing
@@ -99,6 +99,34 @@ extension Integration {
       #endif
     }
 
+    @Test
+    func `dismantle fallback stops controller and clears binding`() async {
+      #if canImport(AppKit)
+      let player = Player(instance: TestInstance.shared)
+      let storage = Box<PiPController?>(nil)
+      let binding = Binding<PiPController?>(
+        get: { storage.value },
+        set: { storage.value = $0 }
+      )
+      let view = PiPVideoView(player, controller: binding)
+      let coordinator = view.makeCoordinator()
+      let controller = PiPController(player: player)
+
+      storage.value = controller
+      coordinator.pipController = controller
+      coordinator.controllerBinding = binding
+
+      PiPVideoView.dismantleNSView(NSView(), coordinator: coordinator)
+      await Task.yield()
+
+      #expect(coordinator.pipController == nil)
+      #expect(coordinator.controllerBinding == nil)
+      #expect(storage.value == nil)
+      #else
+      #expect(Bool(true))
+      #endif
+    }
+
     #if canImport(AppKit)
     @Test
     func `macOS native PiP host attaches drawable child`() {
@@ -181,6 +209,50 @@ extension Integration {
     }
 
     @Test
+    func `macOS native PiP drawable removes VLC subviews only when owned`() {
+      let view = MacNativePiPDrawableView()
+      let ownedSubview = NSView()
+      let externalSubview = NSView()
+
+      view.addVoutSubview(ownedSubview)
+      view.removeVoutSubview(externalSubview)
+      #expect(ownedSubview.superview === view)
+
+      view.removeVoutSubview(ownedSubview)
+      #expect(ownedSubview.superview == nil)
+    }
+
+    @Test
+    func `macOS native PiP drawable lays out direct sublayers`() {
+      let view = MacNativePiPDrawableView()
+      view.frame = CGRect(x: 0, y: 0, width: 320, height: 180)
+      let sublayer = CALayer()
+
+      view.layer?.addSublayer(sublayer)
+      view.restoreVLCContentLayout()
+
+      #expect(sublayer.frame.size == CGSize(width: 320, height: 180))
+    }
+
+    @Test
+    func `macOS native PiP drawable rebinds stale drawable on first nonzero layout`() {
+      let player = Player(instance: TestInstance.shared)
+      let view = MacNativePiPDrawableView()
+      let staleDrawable = NSView()
+
+      view.attach(to: player)
+      player.setDrawable(staleDrawable, owner: view)
+      #expect(player.drawable === staleDrawable)
+
+      view.frame = NSRect(x: 0, y: 0, width: 320, height: 180)
+      view.layout()
+
+      #expect(player.drawable === view)
+
+      view.detach()
+    }
+
+    @Test
     func `macOS native PiP restore repeats full-size VLC content layout`() async {
       let host = MacNativePiPHostView(frame: CGRect(x: 0, y: 0, width: 960, height: 540))
       let drawable = host.drawableView
@@ -238,6 +310,148 @@ extension Integration {
       player.setPlaybackIntentFromExternalControl(false)
       #expect(mediaController.isMediaPlaying() == false)
     }
+
+    @Test
+    func `macOS native PiP backend start stop without media are safe no-ops`() {
+      let initialAllowsPrivateAPI = PiPController.allowsPrivateMacOSAPI
+      defer { PiPController.allowsPrivateMacOSAPI = initialAllowsPrivateAPI }
+      PiPController.allowsPrivateMacOSAPI = false
+
+      let player = Player(instance: TestInstance.shared)
+      let backend = MacNativePiPBackend()
+
+      backend.attach(to: player)
+      backend.start()
+      backend.invalidatePlaybackState()
+      backend.stop()
+
+      #expect(backend.isPossible == false)
+      #expect(backend.isActive == false)
+
+      backend.detach()
+
+      #expect(backend.isPossible == false)
+      #expect(backend.isActive == false)
+    }
+
+    @Test
+    func `macOS PiP controller delegates to native backend`() {
+      let initialAllowsPrivateAPI = PiPController.allowsPrivateMacOSAPI
+      defer { PiPController.allowsPrivateMacOSAPI = initialAllowsPrivateAPI }
+      PiPController.allowsPrivateMacOSAPI = false
+
+      let player = Player(instance: TestInstance.shared)
+      let backend = MacNativePiPBackend()
+      let controller = PiPController(player: player, nativeBackend: backend)
+
+      controller.start()
+      controller.invalidatePictureInPicturePlaybackState()
+      controller.stop()
+      controller.handleNativePictureInPictureReady()
+      controller.handleNativePictureInPictureActiveChanged(true)
+      #expect(controller.isActive == true)
+      controller.handleNativePictureInPictureActiveChanged(false)
+      #expect(controller.isActive == false)
+      controller.handleNativePictureInPictureSetPlaying(true)
+      #expect(controller._pipPlaybackActiveForTesting() == true)
+    }
+
+    @Test
+    func `macOS native PiP media controller defaults without player`() async {
+      let mediaController = MacNativePiPMediaController()
+      let didComplete = Box(false)
+
+      mediaController.play()
+      mediaController.pause()
+      mediaController.seek(by: 250) {
+        didComplete.value = true
+      }
+
+      await Task.yield()
+
+      #expect(didComplete.value)
+      #expect(mediaController.mediaLength() == 0)
+      #expect(mediaController.mediaTime() == 0)
+      #expect(mediaController.isMediaSeekable() == false)
+      #expect(mediaController.isMediaPlaying() == false)
+    }
+
+    @Test
+    func `macOS native PiP media controller reads player defaults and completes seek`() async {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(
+        currentTime: .seconds(5),
+        duration: .seconds(10),
+        isSeekable: true
+      )
+
+      let mediaController = MacNativePiPMediaController()
+      mediaController.player = player
+      let didComplete = Box(false)
+
+      mediaController.play()
+      mediaController.pause()
+      mediaController.seek(by: -10000) {
+        didComplete.value = true
+      }
+
+      await Task.yield()
+      player.setPlaybackIntentFromExternalControl(false)
+
+      #expect(didComplete.value)
+      #expect(player.currentTime == .zero)
+      #expect(mediaController.mediaLength() >= 0)
+      #expect(mediaController.mediaTime() >= 0)
+      _ = mediaController.isMediaSeekable()
+      #expect(mediaController.isMediaPlaying() == false)
+    }
+
+    @Test(.tags(.async, .media), .enabled(if: TestCondition.canPlayMedia), .timeLimit(.minutes(1)))
+    func `macOS native PiP media controller play resumes paused playback`() async throws {
+      let player = Player(instance: TestInstance.makePlayback())
+      let mediaController = MacNativePiPMediaController()
+      mediaController.player = player
+
+      try player.play(Media(url: TestMedia.twosecURL))
+      try #require(await poll(until: { player.state == .playing }), "Waiting for: player.state == .playing")
+
+      player.pause()
+      try #require(await poll(until: { player.state == .paused }), "Waiting for: player.state == .paused")
+
+      mediaController.play()
+      try #require(await poll(until: { mediaController.isMediaPlaying() }), "Waiting for: PiP media controller playback")
+
+      player.stop()
+    }
+
+    @Test
+    func `SwiftUI host creates and updates native PiP view`() async throws {
+      let firstPlayer = Player(instance: TestInstance.shared)
+      let secondPlayer = Player(instance: TestInstance.shared)
+      let storage = Box<PiPController?>(nil)
+      let binding = Binding<PiPController?>(
+        get: { storage.value },
+        set: { storage.value = $0 }
+      )
+      let host = NSHostingView(rootView: PiPVideoView(firstPlayer, controller: binding))
+
+      host.frame = NSRect(x: 0, y: 0, width: 320, height: 180)
+      host.layoutSubtreeIfNeeded()
+      await Task.yield()
+
+      let initialContainer = try #require(host.firstDescendant(ofType: MacNativePiPHostView.self))
+      #expect(firstPlayer.drawable === initialContainer.drawableView)
+      #expect(storage.value != nil)
+
+      host.rootView = PiPVideoView(secondPlayer, controller: binding)
+      host.layoutSubtreeIfNeeded()
+      await Task.yield()
+
+      let updatedContainer = try #require(host.firstDescendant(ofType: MacNativePiPHostView.self))
+      #expect(firstPlayer.drawable == nil)
+      #expect(secondPlayer.drawable === updatedContainer.drawableView)
+      #expect(storage.value != nil)
+    }
     #endif
   }
 }
@@ -251,7 +465,6 @@ private final class Box<T> {
   }
 }
 
-#if canImport(AppKit)
 @MainActor
 private final class PiPReshapeProbeView: NSView {
   var reshapeCount = 0
@@ -261,5 +474,4 @@ private final class PiPReshapeProbeView: NSView {
     reshapeCount += 1
   }
 }
-#endif
 #endif
