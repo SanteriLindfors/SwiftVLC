@@ -28,9 +28,9 @@ BUILD_DIR="${SCRIPT_DIR}/.build-libvlc"
 OUTPUT_DIR="${REPO_ROOT}/Vendor"
 VLC_REPO="https://code.videolan.org/videolan/vlc.git"
 VLC_BRANCH="master"
-# Pin to a known-good commit for reproducible builds (same as VLCKit)
-# Update this hash when upgrading libVLC
-VLC_HASH="c833c4be0"
+# Pin to a known-good commit for reproducible builds.
+# Update this hash when upgrading libVLC.
+VLC_HASH="d179ce4ffa63dbdee36a097ff502f2434ec54531"
 
 # Directory containing patches from VLCKit (optional, user must opt in)
 PATCHES_DIR=""
@@ -727,16 +727,30 @@ build_sh_path = sys.argv[1]
 with open(build_sh_path, 'r') as f:
     content = f.read()
 
+def must_replace(src, needle, replacement, label):
+    if needle not in src:
+        raise SystemExit(
+            f'LDFLAGS patch needle for {label} not found — VLC build.sh shape changed. '
+            f'Update build-libvlc.sh patch_vlc_ldflags to match upstream.'
+        )
+    return src.replace(needle, replacement, 1)
+
 # 1. Fix LDFLAGS in set_host_envvars(): add -isysroot $VLC_APPLE_SDK_PATH
-content = content.replace(
+content = must_replace(
+    content,
     '    export LDFLAGS="$VLC_DEPLOYMENT_TARGET_LDFLAG $VLC_DEPLOYMENT_TARGET_CFLAG -arch $VLC_HOST_ARCH ${bitcode_flag}"',
-    '    export LDFLAGS="$VLC_DEPLOYMENT_TARGET_LDFLAG $VLC_DEPLOYMENT_TARGET_CFLAG -arch $VLC_HOST_ARCH -isysroot $VLC_APPLE_SDK_PATH ${bitcode_flag}"'
+    '    export LDFLAGS="$VLC_DEPLOYMENT_TARGET_LDFLAG $VLC_DEPLOYMENT_TARGET_CFLAG -arch $VLC_HOST_ARCH -isysroot $VLC_APPLE_SDK_PATH ${bitcode_flag}"',
+    'set_host_envvars'
 )
 
 # 2. Fix vlc_ldflags in write_config_mak(): add -isysroot $VLC_APPLE_SDK_PATH
-content = content.replace(
-    '    local vlc_ldflags="$VLC_DEPLOYMENT_TARGET_LDFLAG $VLC_DEPLOYMENT_TARGET_CFLAG  -arch $VLC_HOST_ARCH"',
-    '    local vlc_ldflags="$VLC_DEPLOYMENT_TARGET_LDFLAG $VLC_DEPLOYMENT_TARGET_CFLAG  -arch $VLC_HOST_ARCH -isysroot $VLC_APPLE_SDK_PATH"'
+# Upstream commit ~d179ce4ff switched this line from bash-style $VAR refs to
+# Make-style \$(VAR) refs and dropped the double space — keep needle in sync.
+content = must_replace(
+    content,
+    '    local vlc_ldflags="\\$(VLC_DEPLOYMENT_TARGET_LDFLAG) \\$(VLC_DEPLOYMENT_TARGET_CFLAG) -arch $VLC_HOST_ARCH"',
+    '    local vlc_ldflags="\\$(VLC_DEPLOYMENT_TARGET_LDFLAG) \\$(VLC_DEPLOYMENT_TARGET_CFLAG) -arch $VLC_HOST_ARCH -isysroot $VLC_APPLE_SDK_PATH"',
+    'write_config_mak'
 )
 
 with open(build_sh_path, 'w') as f:
@@ -846,7 +860,7 @@ replacement = (
     '\n'
     '# SWIFTVLC_XROS_TARGET_TRIPLE: the pinned VLC build script leaves xrOS\n'
     '# min-version flags empty, which makes clang stamp objects with the SDK\n'
-    '# version. Use a target triple so visionOS objects keep SwiftVLC's minimum.\n'
+    "# version. Use a target triple so visionOS objects keep SwiftVLC's minimum.\n"
     'if [ "$VLC_HOST_OS" = "xros" ]; then\n'
     '    xros_simulator_suffix=""\n'
     '    if [ -n "$VLC_HOST_PLATFORM_SIMULATOR" ]; then\n'
@@ -1058,6 +1072,86 @@ PYEOF
 }
 
 patch_vlc_disable_rust
+
+# --- Step 1h: Disable libaom (AV1 encoder) ---
+# aom's CMake requires nasm with "multipass optimization" support, which the
+# Homebrew nasm 3.01 (latest stable) does not advertise — configure fails with
+# "Unsupported nasm: multipass optimization not supported." aom is an
+# *encoder*; dav1d handles AV1 *decoding*, which is what playback needs. iOS
+# and tvOS contribs already exclude aom; this also removes it for macOS and
+# Catalyst rather than pinning to an older nasm.
+patch_vlc_disable_aom() {
+    local AOM_RULES="${VLC_SRC}/contrib/src/aom/rules.mak"
+
+    if grep -q 'SWIFTVLC_DISABLE_AOM' "$AOM_RULES"; then
+        info "VLC aom contrib already disabled"
+        return 0
+    fi
+
+    info "Disabling VLC aom contrib (AV1 encoder)..."
+
+    python3 - "$AOM_RULES" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+content = content.replace(
+    'PKGS += aom',
+    '# SWIFTVLC_DISABLE_AOM: nasm 3.01 fails aom_optimization.cmake "multipass\n'
+    '# optimization" probe. aom is an encoder; dav1d handles AV1 decoding,\n'
+    '# which is what playback needs.\n'
+    '# PKGS += aom'
+)
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+
+    info "VLC contrib/src/aom/rules.mak patched to skip aom"
+}
+
+patch_vlc_disable_aom
+
+# --- Step 1i: Sync vendored CLibVLC public headers from the pinned VLC tree ---
+# Sources/CLibVLC/include/vlc/*.h declares the C ABI Swift sees via Clang
+# module import. The compiled libvlc.a in Vendor/ comes from VLC_HASH; if the
+# vendored headers drift from that tree (e.g. a libVLC API signature changes
+# upstream), Swift's auto-generated declarations stop matching the binary and
+# you get link errors or undefined behavior at runtime. Refresh them on every
+# build so the bridge is correct-by-construction.
+#
+# Only public libvlc_*.h + vlc.h are copied — internal VLC headers and contrib
+# headers are not part of the public ABI Swift consumes.
+sync_clibvlc_headers() {
+    local SRC="${VLC_SRC}/include/vlc"
+    local DST="${REPO_ROOT}/Sources/CLibVLC/include/vlc"
+
+    if [ ! -d "$SRC" ]; then
+        error "Expected upstream headers at ${SRC} (VLC clone broken?)"
+    fi
+    if [ ! -d "$DST" ]; then
+        error "Expected vendored CLibVLC dir at ${DST}"
+    fi
+
+    info "Syncing CLibVLC public headers from VLC_HASH=${VLC_HASH:0:10}..."
+
+    local changed=0
+    for f in "$DST"/*.h; do
+        local name; name=$(basename "$f")
+        if [ -f "$SRC/$name" ] && ! diff -q "$f" "$SRC/$name" >/dev/null 2>&1; then
+            cp "$SRC/$name" "$f"
+            info "  updated: $name"
+            changed=$((changed + 1))
+        fi
+    done
+
+    if [ "$changed" -eq 0 ]; then
+        info "  CLibVLC headers already in sync"
+    else
+        info "  $changed header(s) refreshed"
+    fi
+}
+
+sync_clibvlc_headers
 
 # --- Step 2: Build tools ---
 info "Building VLC build tools..."

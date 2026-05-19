@@ -13,23 +13,22 @@
 #
 set -euo pipefail
 
-REPO="harflabs/SwiftVLC"
+REPO="SanteriLindfors/SwiftVLC"
 XCFW_PATH="Vendor/libvlc.xcframework"
 SHOWCASE_PROJECT="Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
 ZIP_NAME="libvlc.xcframework.zip"
 MAX_SIZE=$((2 * 1024 * 1024 * 1024))  # 2 GB (GitHub release asset limit)
 
-# All 8 slices the xcframework must contain. If a slice is missing, the release
-# would ship a partial artifact that fails on one of SwiftVLC's Apple platforms.
+# The 5 slices this fork ships. visionOS and Mac Catalyst are intentionally
+# omitted — build-libvlc.sh is invoked with `--tvos --macos` (iOS by default),
+# which produces exactly these slices. Missing any of them would ship a
+# partial artifact that fails at SPM resolution for the affected platform.
 EXPECTED_SLICES=(
   "ios-arm64"
   "ios-arm64_x86_64-simulator"
   "tvos-arm64"
   "tvos-arm64_x86_64-simulator"
-  "xros-arm64"
-  "xros-arm64_x86_64-simulator"
   "macos-arm64_x86_64"
-  "ios-arm64_x86_64-maccatalyst"
 )
 
 # ── Args ──────────────────────────────────────────────────────────────────────
@@ -170,7 +169,7 @@ local_block = """/* Begin XCLocalSwiftPackageReference section */
 remote_block = f"""/* Begin XCRemoteSwiftPackageReference section */
 \t\tBA000001 /* XCRemoteSwiftPackageReference \"SwiftVLC\" */ = {{
 \t\t\tisa = XCRemoteSwiftPackageReference;
-\t\t\trepositoryURL = \"https://github.com/harflabs/SwiftVLC\";
+\t\t\trepositoryURL = \"https://github.com/SanteriLindfors/SwiftVLC\";
 \t\t\trequirement = {{
 \t\t\t\tkind = exactVersion;
 \t\t\t\tversion = {version};
@@ -182,7 +181,7 @@ remote_pattern = re.compile(
     r'/\* Begin XCRemoteSwiftPackageReference section \*/\n'
     r'\t\tBA000001 /\* XCRemoteSwiftPackageReference "SwiftVLC" \*/ = \{\n'
     r'\t\t\tisa = XCRemoteSwiftPackageReference;\n'
-    r'\t\t\trepositoryURL = "https://github.com/harflabs/SwiftVLC";\n'
+    r'\t\t\trepositoryURL = "https://github.com/SanteriLindfors/SwiftVLC";\n'
     r'\t\t\trequirement = \{\n'
     r'\t\t\t\tkind = (?:upToNextMajorVersion|exactVersion);\n'
     r'\t\t\t\t(?:minimumVersion|version) = [0-9.]+;\n'
@@ -407,7 +406,7 @@ gh release create "$TAG" "$ZIP_PATH" \
 
 Pre-built static xcframework for libVLC 4.0.
 
-**Platforms:** iOS 18+, macOS 15+, tvOS 18+, visionOS 2+, Mac Catalyst
+**Platforms:** iOS 18+, tvOS 18+, macOS 15+
 **Size:** ${ZIP_SIZE_MB} MB (stripped)
 **Checksum:** \`$CHECKSUM\`
 
