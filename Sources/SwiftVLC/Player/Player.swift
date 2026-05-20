@@ -34,6 +34,15 @@ public final class Player {
   /// Current playback time.
   public internal(set) var currentTime: Duration = .zero
 
+  /// Raw libVLC playback time in milliseconds — same value the pause
+  /// gate (`canIssueNativePause`) reads. Diagnostic accessor: lets
+  /// consumers distinguish "libVLC's clock is genuinely at 0" from
+  /// "TimeChanged events haven't been delivered to `currentTime`
+  /// yet". Negative values mean libVLC has no clock yet.
+  public var rawCurrentTimeMs: Int64 {
+    libvlc_media_player_get_time(pointer)
+  }
+
   /// Total media duration (nil until known).
   public internal(set) var duration: Duration?
 
@@ -332,6 +341,15 @@ public final class Player {
 
   var pauseTransition: PauseTransition?
   var deferredPauseCommand: DeferredPauseCommand?
+  /// Wall-clock timestamp of the most-recent transition into `.playing`.
+  /// Used by `canIssueNativePause` to grant pause permission after the
+  /// audio output has had enough time to either fully open or fail —
+  /// the libVLC 4.0 audio-output assertion that the get_time gate is
+  /// designed to prevent fires during the OPENING window only. Once
+  /// the player has been steadily `.playing` for ~1s, opening is
+  /// definitively over and pause is safe even if no audio timestamp
+  /// was ever delivered (e.g. tvOS simulator with broken CoreAudio).
+  var playingSince: Date?
   /// Shadow of the string last passed to `Marquee.setText`. libVLC's text
   /// renderer keys its glyph-bitmap cache on the text string, so a style-
   /// only write (color/opacity/fontSize) hits the cached entry and draws

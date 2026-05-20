@@ -1,4 +1,5 @@
 import CLibVLC
+import Foundation
 import os
 
 /// Event consumer that mirrors `PlayerEvent`s onto `Player`'s
@@ -16,17 +17,32 @@ extension Player {
   /// Whether issuing `set_pause(1)` right now is safe with respect to
   /// libVLC's audio-output state machine.
   ///
-  /// With a real audio output, libVLC can report `.playing` and
-  /// pausable before the first audio timestamp has cleared zero. Pausing
-  /// in that window leaves the aout stream with a stale pause date and
-  /// the next audio block trips libVLC's debug assertion. When audio
-  /// is disabled or not initialized, libVLC reports a negative volume
-  /// sentinel and no aout stream participates in that assertion.
+  /// Three independently-sufficient conditions for safe pause:
+  ///   1. `libvlc_media_player_get_time > 0` — at least one audio
+  ///      timestamp has cleared zero, so the aout stream has a valid
+  ///      pause-date and the libVLC 4.0 assertion in
+  ///      `src/audio_output/dec.c:876` cannot fire.
+  ///   2. `libvlc_audio_get_volume < 0` — audio is disabled or
+  ///      uninitialised; no aout stream participates in that assertion.
+  ///   3. State has been `.playing` for >1s — the audio-output
+  ///      OPENING window is closed; whatever was going to happen
+  ///      (success or failure) has happened, and pausing now will
+  ///      not corrupt an in-progress open. This catches the tvOS
+  ///      Simulator case where CoreAudio's HALC_ProxyIOContext
+  ///      can't keep up, the aout never opens, `get_time` stays
+  ///      at 0 forever, and the first two conditions never fire —
+  ///      without this, pause is permanently queued.
   var canIssueNativePause: Bool {
     if libvlc_media_player_get_time(pointer) > 0 {
       return true
     }
-    return libvlc_audio_get_volume(pointer) < 0
+    if libvlc_audio_get_volume(pointer) < 0 {
+      return true
+    }
+    if let since = playingSince, Date().timeIntervalSince(since) > 1.0 {
+      return true
+    }
+    return false
   }
 
   // MARK: - Event consumer task
@@ -175,7 +191,17 @@ extension Player {
   // MARK: - Playback state + intent publication
 
   func publishPlaybackState(_ newState: PlayerState) {
+    let oldState = state
     state = newState
+    // Track when we enter `.playing` so `canIssueNativePause` can
+    // open after the audio-output opening window has closed (>1s)
+    // even when no audio timestamp ever lands (e.g. simulator
+    // CoreAudio failure).
+    if newState == .playing && oldState != .playing {
+      playingSince = Date()
+    } else if newState != .playing {
+      playingSince = nil
+    }
     withMutation(keyPath: \.isActive) {}
   }
 
