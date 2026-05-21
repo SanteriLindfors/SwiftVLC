@@ -215,12 +215,51 @@ except Exception:
 PYEOF
 }
 
+# ── VLC pin info ──────────────────────────────────────────────────────────────
+#
+# Extracts which upstream VLC commit the xcframework was built from. Embedded
+# in release notes so consumers can map a SwiftVLC release back to a precise
+# point in VideoLAN history (and a future-you can tell, six months from now,
+# whether a downstream bug needs a libvlc rebuild or just a Swift-side fix).
+#
+# Sources, in order of preference:
+#   1. scripts/build-libvlc.sh — always present, authoritative for VLC_HASH.
+#   2. scripts/.build-libvlc/vlc — present after a local build; gives version
+#      from configure.ac and commit subject/date from the cloned working tree.
+#
+# Missing-clone case: we still publish, but the notes show only the hash.
+
+extract_vlc_pin_info() {
+  VLC_HASH=$(awk -F'"' '/^VLC_HASH=/ {print $2; exit}' scripts/build-libvlc.sh)
+  VLC_REPO_URL=$(awk -F'"' '/^VLC_REPO=/ {print $2; exit}' scripts/build-libvlc.sh)
+  if [[ -z "$VLC_HASH" ]]; then
+    echo "Error: could not read VLC_HASH from scripts/build-libvlc.sh" >&2
+    exit 1
+  fi
+
+  VLC_VERSION=""
+  VLC_COMMIT_DATE=""
+  VLC_COMMIT_SUBJECT=""
+  local vlc_clone="scripts/.build-libvlc/vlc"
+  if [[ -d "$vlc_clone/.git" ]]; then
+    if [[ -f "$vlc_clone/configure.ac" ]]; then
+      VLC_VERSION=$(awk -F'[][]' '/^AC_INIT/ {print $4; exit}' "$vlc_clone/configure.ac" 2>/dev/null || true)
+    fi
+    if git -C "$vlc_clone" cat-file -e "${VLC_HASH}^{commit}" 2>/dev/null; then
+      VLC_COMMIT_DATE=$(git -C "$vlc_clone" log -1 --format='%cs' "$VLC_HASH" 2>/dev/null || true)
+      VLC_COMMIT_SUBJECT=$(git -C "$vlc_clone" log -1 --format='%s' "$VLC_HASH" 2>/dev/null || true)
+    fi
+  fi
+}
+
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
 if [[ ! -d "$XCFW_PATH" ]]; then
   echo "Error: $XCFW_PATH not found. Build it first: ./scripts/build-libvlc.sh --all" >&2
   exit 1
 fi
+
+extract_vlc_pin_info
 
 # Verify every expected platform slice is present. Missing slices would produce
 # a release that breaks at SPM-resolution time for affected platforms.
@@ -398,21 +437,46 @@ git push origin "$TAG"
 # ── GitHub Release ────────────────────────────────────────────────────────────
 
 echo "Creating GitHub Release..."
+
+# Optional rows — only emitted when extract_vlc_pin_info populated them, so
+# releases built without the VLC clone present (e.g. CI fetching a prebuilt
+# xcframework) still produce valid notes.
+VLC_VERSION_LINE=""
+VLC_DATE_LINE=""
+VLC_SUBJECT_LINE=""
+[[ -n "$VLC_VERSION" ]]        && VLC_VERSION_LINE=$'\n'"**libVLC version:** ${VLC_VERSION}"
+[[ -n "$VLC_COMMIT_DATE" ]]    && VLC_DATE_LINE=$'\n'"**Commit date:** ${VLC_COMMIT_DATE}"
+[[ -n "$VLC_COMMIT_SUBJECT" ]] && VLC_SUBJECT_LINE=$'\n'"**Subject:** ${VLC_COMMIT_SUBJECT}"
+
+RELEASE_NOTES=$(cat <<EOF
+## libVLC xcframework — built from VideoLAN/vlc @ ${VLC_HASH:0:10}${VLC_VERSION_LINE}
+**Source:** ${VLC_REPO_URL}
+**Commit:** \`${VLC_HASH}\`${VLC_DATE_LINE}${VLC_SUBJECT_LINE}
+
+**Asset:** \`${ZIP_NAME}\` (${ZIP_SIZE_MB} MB, stripped)
+**Checksum:** \`${CHECKSUM}\`
+
+**Platform slices:**
+- iOS 18+ (arm64, simulator arm64+x86_64)
+- tvOS 18+ (arm64, simulator arm64+x86_64)
+- macOS 15+ (arm64+x86_64)
+
+### Consume via Swift Package Manager
+
+\`\`\`swift
+dependencies: [
+    .package(url: "https://github.com/${REPO}", exact: "${VERSION}")
+]
+\`\`\`
+
+SPM auto-downloads the xcframework and verifies the checksum.
+EOF
+)
+
 gh release create "$TAG" "$ZIP_PATH" \
   --repo "$REPO" \
   --title "SwiftVLC $TAG" \
-  --notes "$(cat <<EOF
-## libVLC xcframework
-
-Pre-built static xcframework for libVLC 4.0.
-
-**Platforms:** iOS 18+, tvOS 18+, macOS 15+
-**Size:** ${ZIP_SIZE_MB} MB (stripped)
-**Checksum:** \`$CHECKSUM\`
-
-SPM resolves this automatically — just add the package dependency.
-EOF
-)"
+  --notes "$RELEASE_NOTES"
 
 echo "Pushing $CURRENT_BRANCH to origin/main..."
 git push origin HEAD:main
