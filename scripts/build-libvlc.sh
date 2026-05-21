@@ -30,7 +30,7 @@ VLC_REPO="https://code.videolan.org/videolan/vlc.git"
 VLC_BRANCH="master"
 # Pin to a known-good commit for reproducible builds.
 # Update this hash when upgrading libVLC.
-VLC_HASH="d179ce4ffa63dbdee36a097ff502f2434ec54531"
+VLC_HASH="3626851e2cb99d7a313af7bf6cc267079cd5d244"
 
 # Directory containing patches from VLCKit (optional, user must opt in)
 PATCHES_DIR=""
