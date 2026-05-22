@@ -813,6 +813,136 @@ PYEOF
 
 patch_vlc_videotoolbox_caps
 
+# --- Step 1c3: Fix HEVC hvcC handling for in-band parameter sets ---
+# modules/codec/videotoolbox/decoder.c hands VideoToolbox the container's raw
+# hvcC whenever fmt_in->i_extra is non-zero. Some containers (notably Matroska)
+# ship a *stub* hvcC — a 23-byte config record with zero VPS/SPS/PPS arrays —
+# and carry the parameter sets in-band in the elementary stream. Feeding that
+# stub to VT fails with "ProcessHvcC failed" / kVTVideoDecoderBadDataErr, so
+# HEVC silently falls back to avcodec software (10-bit yuv420p10le + swscale =
+# dropped frames).
+#
+# The decoder already gathers in-band parameter sets via hxxx_helper
+# (ProcessBlockHEVC) and already has an "else if (hxxx_helper_has_config)"
+# branch that rebuilds a complete hvcC from them — it just never runs because
+# the raw-extradata branch wins and the late-start path isn't triggered for
+# stub-hvcC streams. Two changes:
+#   1. LateStartHEVC: defer VT startup until hxxx_helper actually has a usable
+#      config (from complete extradata OR gathered in-band), instead of keying
+#      on i_extra == 0. Lets the late-start loop gather the in-band sets first.
+#   2. CopyDecoderExtradataHEVC: prefer the helper-rebuilt complete hvcC; fall
+#      back to the container's raw extradata only when the helper has none.
+# Complete-hvcC streams (MP4) are unaffected: hxxx_helper parses the embedded
+# sets at open, so has_config is true immediately and behaviour is unchanged.
+patch_vlc_videotoolbox_hevc_hvcc() {
+    local DECODER_C="${VLC_SRC}/modules/codec/videotoolbox/decoder.c"
+
+    if grep -q 'prefer helper-rebuilt hvcC' "$DECODER_C"; then
+        info "VLC videotoolbox HEVC hvcC handling already patched"
+        return 0
+    fi
+
+    info "Patching VideoToolbox HEVC hvcC reconstruction for in-band params..."
+
+    python3 - "$DECODER_C" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+def must_replace(src, needle, replacement, label):
+    if needle not in src:
+        raise SystemExit(
+            f'HEVC hvcC patch needle for {label} not found — '
+            f'decoder.c shape changed. Update patch_vlc_videotoolbox_hevc_hvcc.'
+        )
+    return src.replace(needle, replacement, 1)
+
+# 1. LateStartHEVC: defer until a usable config exists (extradata or in-band).
+content = must_replace(
+    content,
+    '''static bool LateStartHEVC(decoder_t *p_dec)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    struct vt_hevc_context *hevcctx = p_sys->p_codec_context;
+    return (p_dec->fmt_in->i_extra == 0 && !hxxx_helper_has_config(&hevcctx->hh));
+}''',
+    '''static bool LateStartHEVC(decoder_t *p_dec)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    struct vt_hevc_context *hevcctx = p_sys->p_codec_context;
+    /* Defer VT startup until a usable config exists — from a complete hvcC in
+     * the extradata OR gathered in-band. Keying on i_extra == 0 alone would
+     * start VT immediately for stub-hvcC streams (e.g. Matroska HEVC with
+     * in-band parameter sets), which then fail in ProcessHvcC. */
+    return !hxxx_helper_has_config(&hevcctx->hh);
+}''',
+    'LateStartHEVC')
+
+# 2. CopyDecoderExtradataHEVC: prefer helper-rebuilt hvcC, fall back to raw.
+content = must_replace(
+    content,
+    '''    CFDictionaryRef extradata = NULL;
+    if (p_dec->fmt_in->i_extra && hevcctx->hh.i_input_nal_length_size)
+    {
+        /* copy DecoderConfiguration */
+        extradata = ExtradataInfoCreate(CFSTR("hvcC"),
+                                        p_dec->fmt_in->p_extra,
+                                        p_dec->fmt_in->i_extra);
+    }
+    else if (hxxx_helper_has_config(&hevcctx->hh))
+    {
+        /* build DecoderConfiguration from gathered */
+        block_t *p_hvcC = hxxx_helper_get_extradata_block(&hevcctx->hh);
+        if (p_hvcC)
+        {
+            extradata = ExtradataInfoCreate(CFSTR("hvcC"),
+                                            p_hvcC->p_buffer,
+                                            p_hvcC->i_buffer);
+            block_Release(p_hvcC);
+        }
+    }
+    return extradata;''',
+    '''    CFDictionaryRef extradata = NULL;
+    /* prefer helper-rebuilt hvcC: containers like Matroska ship a stub hvcC
+     * with no VPS/SPS/PPS arrays and carry the parameter sets in-band; handing
+     * that stub to VideoToolbox fails (ProcessHvcC). The helper has the real
+     * sets (from extradata or gathered in-band), so build a complete hvcC from
+     * it and only fall back to the raw container extradata when it has none. */
+    if (hxxx_helper_has_config(&hevcctx->hh))
+    {
+        block_t *p_hvcC = hxxx_helper_get_extradata_block(&hevcctx->hh);
+        if (p_hvcC)
+        {
+            extradata = ExtradataInfoCreate(CFSTR("hvcC"),
+                                            p_hvcC->p_buffer,
+                                            p_hvcC->i_buffer);
+            block_Release(p_hvcC);
+        }
+    }
+    if (extradata == NULL &&
+        p_dec->fmt_in->i_extra && hevcctx->hh.i_input_nal_length_size)
+    {
+        /* copy container DecoderConfiguration as-is */
+        extradata = ExtradataInfoCreate(CFSTR("hvcC"),
+                                        p_dec->fmt_in->p_extra,
+                                        p_dec->fmt_in->i_extra);
+    }
+    return extradata;''',
+    'CopyDecoderExtradataHEVC')
+
+with open(path, 'w') as f:
+    f.write(content)
+
+print('VideoToolbox HEVC hvcC reconstruction patched')
+PYEOF
+
+    info "VideoToolbox HEVC hvcC handling patched"
+}
+
+patch_vlc_videotoolbox_hevc_hvcc
+
 # --- Step 1d: Patch VLC for Mac Catalyst support ---
 if [ "$BUILD_CATALYST" = "yes" ]; then
     patch_vlc_for_catalyst
