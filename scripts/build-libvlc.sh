@@ -699,6 +699,120 @@ PYEOF
 
 patch_vlc_snapshot_filter_owner
 
+# --- Step 1c2: Un-gate VideoToolbox capability checks on tvOS + simulator ---
+# modules/codec/videotoolbox/decoder.c gates HEVC, 10-bit 4:2:0, H264 High-10
+# profiles, and H264 levels >4.2 behind capability probes that are wrong off
+# real iOS/tvOS hardware:
+#   - deviceSupportsHEVC() -> VTIsHardwareDecodeSupported(HEVC) returns false
+#     in the Simulator even though the host Mac can decode HEVC (this is why
+#     HEVC silently fell back to ffmpeg software + a costly swscale chain).
+#   - the advanced-profile / advanced-level / 10-bit checks read host sysctl /
+#     Metal state, which is meaningless in the Simulator.
+# On a real Apple TV 4K (A10X+) every one of these already returns true, so
+# forcing them on tvOS is a no-op there; it only removes the artificial
+# Simulator/Intel-host gating so HEVC + 10-bit + 4K route through VideoToolbox
+# everywhere. If VT ever fails, VLC still falls back to avcodec, so there is no
+# regression risk. iOS-device and macOS logic is left untouched.
+patch_vlc_videotoolbox_caps() {
+    local DECODER_C="${VLC_SRC}/modules/codec/videotoolbox/decoder.c"
+
+    if grep -q 'TARGET_OS_TV || TARGET_OS_SIMULATOR' "$DECODER_C"; then
+        info "VLC videotoolbox capability gates already patched"
+        return 0
+    fi
+
+    info "Un-gating VideoToolbox capability checks for tvOS + simulator..."
+
+    python3 - "$DECODER_C" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+def must_replace(src, needle, replacement, label):
+    if needle not in src:
+        raise SystemExit(
+            f'videotoolbox caps patch needle for {label} not found — '
+            f'decoder.c shape changed. Update patch_vlc_videotoolbox_caps.'
+        )
+    return src.replace(needle, replacement, 1)
+
+# 1. deviceSupportsHEVC
+content = must_replace(
+    content,
+    '''    if (__builtin_available(macOS 10.13, iOS 11.0, tvOS 11.0, *))
+        return VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
+    else
+        return false;''',
+    '''#if TARGET_OS_TV || TARGET_OS_SIMULATOR
+    return true;
+#else
+    if (__builtin_available(macOS 10.13, iOS 11.0, tvOS 11.0, *))
+        return VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
+    else
+        return false;
+#endif''',
+    'deviceSupportsHEVC')
+
+# 2. deviceSupports42010bitRendering
+content = must_replace(
+    content,
+    '''#if TARGET_OS_IPHONE
+    /* iPhone/iPad/aTV needs metal device to render 420 10bit */
+    return cvpx_system_has_metal_device();
+#else
+    /* macOS can render 420 10bit with OpenGL and Metal */
+    return true;
+#endif''',
+    '''#if TARGET_OS_TV || TARGET_OS_SIMULATOR
+    return true;
+#elif TARGET_OS_IPHONE
+    /* iPhone/iPad/aTV needs metal device to render 420 10bit */
+    return cvpx_system_has_metal_device();
+#else
+    /* macOS can render 420 10bit with OpenGL and Metal */
+    return true;
+#endif''',
+    'deviceSupports42010bitRendering')
+
+# 3. deviceSupportsAdvancedProfiles
+content = must_replace(
+    content,
+    '''static Boolean deviceSupportsAdvancedProfiles()
+{
+#if TARGET_OS_IPHONE''',
+    '''static Boolean deviceSupportsAdvancedProfiles()
+{
+#if TARGET_OS_TV || TARGET_OS_SIMULATOR
+    return true;
+#elif TARGET_OS_IPHONE''',
+    'deviceSupportsAdvancedProfiles')
+
+# 4. deviceSupportsAdvancedLevels
+content = must_replace(
+    content,
+    '''static Boolean deviceSupportsAdvancedLevels()
+{
+#if TARGET_OS_IPHONE''',
+    '''static Boolean deviceSupportsAdvancedLevels()
+{
+#if TARGET_OS_TV || TARGET_OS_SIMULATOR
+    return true;
+#elif TARGET_OS_IPHONE''',
+    'deviceSupportsAdvancedLevels')
+
+with open(path, 'w') as f:
+    f.write(content)
+
+print('VideoToolbox capability gates un-gated for tvOS + simulator')
+PYEOF
+
+    info "VideoToolbox capability gates patched"
+}
+
+patch_vlc_videotoolbox_caps
+
 # --- Step 1d: Patch VLC for Mac Catalyst support ---
 if [ "$BUILD_CATALYST" = "yes" ]; then
     patch_vlc_for_catalyst
